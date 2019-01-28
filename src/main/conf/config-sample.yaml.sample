@@ -1,0 +1,6 @@
+twitter: 
+   consumerKey: "Your Twitter API Consumer Key"
+   consumerSecret: "Twitter API Consumer Secret"
+   token: "Twitter API Token"
+   tokenSecret: "Twitter API Token secret"
+   streamURI: "https: //stream.twitter.com/1.1/statuses/filter.json"
