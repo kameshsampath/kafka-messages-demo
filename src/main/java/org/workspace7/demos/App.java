@@ -5,28 +5,28 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.stream.Collectors;
 import com.google.common.base.Preconditions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.workspace7.demos.model.Status;
+import org.workspace7.demos.stream.JsonChunkWriteStream;
 import org.workspace7.model.OAuth1Param;
 import org.workspace7.util.GeneralUtil;
 import org.workspace7.util.TwitterOAuth1Util;
-import io.vertx.codegen.annotations.Nullable;
-import io.vertx.core.AbstractVerticle;
-import io.vertx.core.Handler;
-import io.vertx.core.MultiMap;
-import io.vertx.core.buffer.Buffer;
-import io.vertx.core.json.Json;
-import io.vertx.core.streams.WriteStream;
-import io.vertx.ext.web.Router;
-import io.vertx.ext.web.RoutingContext;
-import io.vertx.ext.web.client.WebClient;
-import io.vertx.ext.web.codec.BodyCodec;
-import io.vertx.ext.web.handler.BodyHandler;
-import io.vertx.reactivex.core.parsetools.JsonParser;
+import io.vertx.core.json.JsonObject;
+import io.vertx.reactivex.core.AbstractVerticle;
+import io.vertx.reactivex.core.MultiMap;
+import io.vertx.reactivex.ext.web.Router;
+import io.vertx.reactivex.ext.web.RoutingContext;
+import io.vertx.reactivex.ext.web.client.WebClient;
+import io.vertx.reactivex.ext.web.codec.BodyCodec;
+import io.vertx.reactivex.ext.web.handler.BodyHandler;
+import io.vertx.reactivex.kafka.client.producer.KafkaProducer;
+import io.vertx.reactivex.kafka.client.producer.KafkaProducerRecord;
 
 /**
  * 
@@ -35,6 +35,8 @@ import io.vertx.reactivex.core.parsetools.JsonParser;
 public class App extends AbstractVerticle {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(App.class);
+    private KafkaProducer kafkaProducer;
+    private final Map<String, String> kafkaProducerConfig = new HashMap<>();
 
     public void start() {
 
@@ -48,6 +50,11 @@ public class App extends AbstractVerticle {
         router.post("/statuses").handler(this::handleStatuses);
 
         vertx.createHttpServer().requestHandler(router).listen(8080);
+
+        kafkaProducerConfig.put("bootstrap.servers", config().getString("bootstrap.servers"));
+        kafkaProducerConfig.put("acks", "1");
+        kafkaProducerConfig.put("key.serializer", config().getString("key.serializer"));
+        kafkaProducerConfig.put("value.serializer", config().getString("value.serializer"));
     }
 
 
@@ -56,6 +63,7 @@ public class App extends AbstractVerticle {
     }
 
     private void handleStatuses(RoutingContext routingContext) {
+        kafkaProducer = KafkaProducer.create(vertx, kafkaProducerConfig);
         String consumerKey = config().getJsonObject("twitter").getString("consumerKey");
         String consumerSecret = config().getJsonObject("twitter").getString("consumerSecret");
         String token = config().getJsonObject("twitter").getString("token");
@@ -73,17 +81,26 @@ public class App extends AbstractVerticle {
         Preconditions.checkNotNull(tokenSecret,
                 "Twitter API requires %s, visit https://developer.twitter.com", "tokenSecret");
 
+        Map<String, String> getParams = Collections.emptyMap();
 
-        // TODO get from params
-        String searchTerms = "knative,#knative,serverless,#serverless";
-        Map<String, String> getParams = new HashMap<>();
+        JsonObject requestBody = routingContext.getBodyAsJson();
+
+        if (requestBody == null || requestBody.getMap().isEmpty()) {
+            routingContext.response().end("Required valid request body");
+        }
+
         Map<String, String> postParams = new HashMap<>();
-        postParams.put("track", searchTerms);
-        // filterParams.put("filter_level","medium");
-        postParams.put("language", "en");
+        requestBody.getJsonObject("postParams").getMap()
+                .forEach((k, v) -> postParams.put(k, String.valueOf(v)));
+
+        if (!postParams.containsKey("language")) {
+            postParams.put("language", "en");
+        }
 
         OAuth1Param oAuth1Param = new OAuth1Param(consumerKey, GeneralUtil.nonce(), "",
                 GeneralUtil.timestampString(), token);
+
+        routingContext.response().setChunked(true);
 
         try {
             URI requestURI = new URI(streamUrl);
@@ -92,72 +109,51 @@ public class App extends AbstractVerticle {
 
             WebClient webClient = WebClient.create(vertx);
 
-            JsonParser parser = JsonParser.newParser().objectValueMode();
+            JsonChunkWriteStream stream = new JsonChunkWriteStream();
 
-            parser.toFlowable().map(j -> {
-                Status s = Json.mapper.convertValue(j.objectValue().getMap(), Status.class);
-                return s;
-            }).subscribe(e -> {
-                LOGGER.info("{}", Json.encodePrettily(e));
-            }, Throwable::printStackTrace);
+            webClient.postAbs(streamUrl)
+                    .as(new BodyCodec<>(io.vertx.ext.web.codec.BodyCodec.pipe(stream)))
+                    .putHeader("Authorization", strOAuth)
+                    .rxSendForm(MultiMap.caseInsensitiveMultiMap().addAll(postParams))
+                    .doOnSuccess(s -> System.out.println("onSuccess")).subscribe();
 
-            webClient.postAbs(streamUrl).as(BodyCodec.pipe(new WriteStream<Buffer>() {
+            stream.toFlowable().subscribe(jObj -> {
+                LOGGER.info("Got Status: {}", jObj);
+                String key = postParams.get("track");
+                KafkaProducerRecord<String, String> record =
+                        KafkaProducerRecord.create("twitter_statuses", key, jObj.encode());
 
-                @Override
-                public boolean writeQueueFull() {
-                    return false;
-                }
+                kafkaProducer.rxWrite(record).subscribe(metadata -> {
+                    LOGGER.info("Successfuly written record to Kafka {}", metadata);
+                }, err -> {
+                    LOGGER.error("Error writing record to Kafka", err);
+                });
 
-                @Override
-                public WriteStream<Buffer> write(Buffer data) {
-                    LOGGER.trace("Buffer:{} length = {}", data, data.toString().trim().length());
-                    if (data != null && data.toString().trim().length() > 0) {
-                        parser.handle(
-                                io.vertx.reactivex.core.buffer.Buffer.buffer(data.toString()));
-                    }
-                    return this;
-                }
-
-                @Override
-                public WriteStream<Buffer> setWriteQueueMaxSize(int maxSize) {
-                    return this;
-                }
-
-                @Override
-                public WriteStream<Buffer> exceptionHandler(Handler<Throwable> handler) {
-                    return this;
-                }
-
-                @Override
-                public void end() {
-                    parser.end();
-                }
-
-                @Override
-                public WriteStream<Buffer> drainHandler(@Nullable Handler<Void> handler) {
-                    return this;
-                }
-            })).putHeader("Authorization", strOAuth)
-                    .sendForm(MultiMap.caseInsensitiveMultiMap().addAll(postParams), ar -> {
-                        if (ar.failed()) {
-                            LOGGER.error("Error", ar.cause());
-                        } else {
-                            LOGGER.info("Getting messages");
-                        }
-                    });
+                routingContext.response().write(jObj.encode());
+            }, err -> {
+                LOGGER.error("Error processing status", err);
+                routingContext.response().setStatusCode(503)
+                        .end("Error processing message " + err.getMessage());
+            }, () -> {
+                LOGGER.info("Status DONE");
+            });
 
         } catch (InvalidKeyException e) {
-            // TODO Auto-generated catch block
-            e.printStackTrace();
+            LOGGER.error("Error processing status", e);
+            routingContext.response().setStatusCode(503)
+                    .end("Error processing message " + e.getMessage());
         } catch (UnsupportedEncodingException e) {
-            // TODO Auto-generated catch block
-            e.printStackTrace();
+            LOGGER.error("Error processing status", e);
+            routingContext.response().setStatusCode(503)
+                    .end("Error processing message " + e.getMessage());
         } catch (NoSuchAlgorithmException e) {
-            // TODO Auto-generated catch block
-            e.printStackTrace();
+            LOGGER.error("Error processing status", e);
+            routingContext.response().setStatusCode(503)
+                    .end("Error processing message " + e.getMessage());
         } catch (URISyntaxException e) {
-            // TODO Auto-generated catch block
-            e.printStackTrace();
+            LOGGER.error("Error processing status", e);
+            routingContext.response().setStatusCode(503)
+                    .end("Error processing message " + e.getMessage());
         }
     }
 }
