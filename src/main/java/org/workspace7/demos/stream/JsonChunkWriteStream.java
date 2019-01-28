@@ -1,5 +1,7 @@
 package org.workspace7.demos.stream;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import io.reactivex.Flowable;
 import io.vertx.codegen.annotations.Nullable;
 import io.vertx.core.Handler;
@@ -13,6 +15,8 @@ import io.vertx.reactivex.core.parsetools.JsonParser;
  * JsonChunkWriteStream
  */
 public class JsonChunkWriteStream implements WriteStream<Buffer> {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(JsonChunkWriteStream.class);
 
     private JsonParser parser;
 
@@ -34,6 +38,7 @@ public class JsonChunkWriteStream implements WriteStream<Buffer> {
     public WriteStream<Buffer> write(Buffer data) {
         parser.write(io.vertx.reactivex.core.buffer.Buffer.newInstance(data));
         return this;
+
     }
 
     @Override

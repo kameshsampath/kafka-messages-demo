@@ -112,7 +112,7 @@
           </execution>
         </executions>
         <configuration>
-          <redeploy>true</redeploy>
+          <redeploy>false</redeploy>
         </configuration>
       </plugin>
     </plugins>
